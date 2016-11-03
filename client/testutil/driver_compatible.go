@@ -51,3 +51,9 @@ func MountCompatible(t *testing.T) {
 		t.Skip("Must be root to run test")
 	}
 }
+
+func VMWCompatible(t *testing.T) {
+	if runtime.GOOS != "linux" || syscall.Geteuid() != 0 {
+		t.Skip("Test only available running as root on linux")
+	}
+}
