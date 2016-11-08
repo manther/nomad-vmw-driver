@@ -25,6 +25,7 @@ var BuiltinDrivers = map[string]Factory{
 	"java":     NewJavaDriver,
 	"qemu":     NewQemuDriver,
 	"rkt":      NewRktDriver,
+	"vmw":      NewVMWDriver,
 }
 
 // NewDriver is used to instantiate and return a new driver
@@ -98,7 +99,7 @@ func NewEmptyDriverContext() *DriverContext {
 // private to the driver. If we want to change this later we can gorename all of
 // the fields in DriverContext.
 func NewDriverContext(taskName string, config *config.Config, node *structs.Node,
-	logger *log.Logger, taskEnv *env.TaskEnvironment) *DriverContext {
+logger *log.Logger, taskEnv *env.TaskEnvironment) *DriverContext {
 	return &DriverContext{
 		taskName: taskName,
 		config:   config,
@@ -137,7 +138,7 @@ type ExecContext struct {
 	AllocDir *allocdir.AllocDir
 
 	// Alloc ID
-	AllocID string
+	AllocID  string
 }
 
 // NewExecContext is used to create a new execution context
@@ -148,7 +149,7 @@ func NewExecContext(alloc *allocdir.AllocDir, allocID string) *ExecContext {
 // GetTaskEnv converts the alloc dir, the node, task and alloc into a
 // TaskEnvironment.
 func GetTaskEnv(allocDir *allocdir.AllocDir, node *structs.Node,
-	task *structs.Task, alloc *structs.Allocation, vaultToken string) (*env.TaskEnvironment, error) {
+task *structs.Task, alloc *structs.Allocation, vaultToken string) (*env.TaskEnvironment, error) {
 
 	tg := alloc.Job.LookupTaskGroup(alloc.TaskGroup)
 	env := env.NewTaskEnvironment(node).
