@@ -38,6 +38,7 @@ var (
 		"exec",
 		"qemu",
 		"java",
+		"vmw",
 	}, ",")
 )
 

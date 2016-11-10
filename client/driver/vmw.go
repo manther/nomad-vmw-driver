@@ -16,6 +16,12 @@ import (
 	"time"
 )
 
+const (
+	// The key populated in Node Attributes to indicate the presence of the Exec
+	// driver
+	vmwDriverAttr = "driver.vmw"
+)
+
 type VMWDriver struct {
 	name               string
 	memory             int
@@ -52,7 +58,7 @@ type VMWDriver struct {
 type VMWDriverConfig struct {
 	Name           string `mapstructure:"name"`
 	URL            string `mapstructure:"url"`
-	DatacenterName string `mapstructure:"dtacenter"`
+	DatacenterName string `mapstructure:"datacenter"`
 	VMName         string `mapstructure:"vmname"`
 	Network        string `mapstructure:"network"`
 	Insecure       string `mapstructure:"insecure"`
@@ -84,6 +90,13 @@ func (d *VMWDriver) Abilities() DriverAbilities {
 }
 
 func (d *VMWDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, error) {
+	// Get the current status so that we can log any debug messages only if the
+	// state changes
+	_, currentlyEnabled := node.Attributes[vmwDriverAttr]
+	if !currentlyEnabled {
+		d.logger.Printf("[DEBUG] driver.vmw: enabling driver")
+	}
+	node.Attributes[vmwDriverAttr] = "1"
 	return true, nil
 }
 
@@ -106,7 +119,10 @@ func (d *VMWDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 
 	_, err = vmw.cloneVM(context.TODO())
 	if err != nil {
+		d.logger.Printf("[ERR] Error deploying VM: %s. Error: %s", driverConfig.Name, err)
 		return nil, err
+	} else {
+		d.logger.Printf("[INFO] VM: %s: deployed successfully!", driverConfig.Name)
 	}
 	return nil, nil
 }
@@ -120,6 +136,7 @@ func (d *VMWDriver) Periodic() (bool, time.Duration) {
 }
 
 func (job *VMWDriver) cloneVM(ctx context.Context) (*object.Task, error) {
+	job.logger.Printf("Here1")
 	hosturl, err := url.Parse(job.URL)
 
 	job.Client, err = govmomi.NewClient(ctx, hosturl, true)
@@ -155,7 +172,7 @@ func (job *VMWDriver) cloneVM(ctx context.Context) (*object.Task, error) {
 	if card == nil {
 		return nil, fmt.Errorf("No network device found.")
 	}
-
+	job.logger.Printf("Here2")
 	if job.Network, err = job.Finder.NetworkOrDefault(context.TODO(), job.NetworkName); err != nil {
 		return nil, err
 	}
@@ -206,7 +223,7 @@ func (job *VMWDriver) cloneVM(ctx context.Context) (*object.Task, error) {
 		hostref := job.HostSystem.Reference()
 		relocateSpec.Host = &hostref
 	}
-
+	job.logger.Printf("Here3")
 	cloneSpec := &types.VirtualMachineCloneSpec{
 		Location: relocateSpec,
 		PowerOn:  false,
@@ -285,7 +302,7 @@ func (job *VMWDriver) cloneVM(ctx context.Context) (*object.Task, error) {
 			return nil, fmt.Errorf("File %s already exists", dsPath)
 		}
 	}
-
+	job.logger.Printf("Here4")
 	// check if customization specification requested
 	if len(job.customization) > 0 {
 		// get the customization spec manager
@@ -308,8 +325,10 @@ func (job *VMWDriver) cloneVM(ctx context.Context) (*object.Task, error) {
 		cloneSpec.Customization = &customSpec
 	}
 
+	job.logger.Printf("Here5")
 	// clone virtual machine
-	return job.VirtualMachine.Clone(ctx, job.Folder, job.name, *cloneSpec)
+	result, err := job.VirtualMachine.Clone(ctx, job.Folder, job.name, *cloneSpec)
+	return result, err
 }
 
 func getDatacenter(c *govmomi.Client, dc string) (*object.Datacenter, error) {
