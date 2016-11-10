@@ -1,29 +1,38 @@
 package driver
 
 import (
-	"fmt"
 	"context"
-	"net/url"
+	"fmt"
+	"github.com/hashicorp/nomad/client/config"
+	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/mitchellh/mapstructure"
 	"github.com/vmware/govmomi"
+	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/property"
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
-	"github.com/vmware/govmomi/find"
-	"github.com/hashicorp/nomad/client/config"
-	"github.com/hashicorp/nomad/nomad/structs"
+	"net/url"
 	"time"
 )
 
 type VMWDriver struct {
-	name           string
-	memory         int
-	cpus           int
-	on             bool
-	force          bool
-	template       bool
-	customization  string
-	waitForIP      bool
+	name               string
+	memory             int
+	cpus               int
+	on                 bool
+	force              bool
+	template           bool
+	customization      string
+	waitForIP          bool
+	URL                string
+	Insecure           string
+	NetworkName        string
+	NetAdapterType     string
+	RescourcePoolName  string
+	DatacenterName     string
+	VirtualMachineName string
+	DatastoreName      string
 
 	Client         *govmomi.Client
 	Datacenter     *object.Datacenter
@@ -36,11 +45,32 @@ type VMWDriver struct {
 	Network        object.NetworkReference
 	Device         types.BaseVirtualDevice
 	Finder         *find.Finder
+
 	DriverContext
+}
+
+type VMWDriverConfig struct {
+	Name           string `mapstructure:"name"`
+	URL            string `mapstructure:"url"`
+	DatacenterName string `mapstructure:"dtacenter"`
+	VMName         string `mapstructure:"vmname"`
+	Network        string `mapstructure:"network"`
+	Insecure       string `mapstructure:"insecure"`
+	DatastoreName  string `mapstructure:"datastore"`
+	Pool           string `mapstructure:"pool"`
+	NetAdapterType string `mapstructure:"netadapter"`
 }
 
 func NewVMWDriver(ctx *DriverContext) Driver {
 	return &VMWDriver{DriverContext: *ctx}
+}
+
+func NewVMWDriverConfig(task *structs.Task) (*VMWDriverConfig, error) {
+	var driverConfig VMWDriverConfig
+	if err := mapstructure.WeakDecode(task.Config, &driverConfig); err != nil {
+		return nil, err
+	}
+	return &driverConfig, nil
 }
 
 func (c *VMWDriver) Validate(map[string]interface{}) error {
@@ -58,10 +88,25 @@ func (d *VMWDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, e
 }
 
 func (d *VMWDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
-	vmw := &VMWDriver{name: "new-zombie-nomad-vm"}
-	_, err := vmw.cloneVM(ctx)
+	driverConfig, err := NewVMWDriverConfig(task)
 	if err != nil {
-		fmt.Printf("%v\n", err)
+		return nil, err
+	}
+	vmw := &VMWDriver{
+		name:               driverConfig.Name,
+		URL:                driverConfig.URL,
+		DatacenterName:     driverConfig.DatacenterName,
+		VirtualMachineName: driverConfig.VMName,
+		RescourcePoolName:  driverConfig.Pool,
+		DatastoreName:      driverConfig.DatastoreName,
+		Insecure:           driverConfig.Insecure,
+		NetworkName:        driverConfig.Network,
+		NetAdapterType:     driverConfig.NetAdapterType,
+	}
+
+	_, err = vmw.cloneVM(context.TODO())
+	if err != nil {
+		return nil, err
 	}
 	return nil, nil
 }
@@ -74,30 +119,22 @@ func (d *VMWDriver) Periodic() (bool, time.Duration) {
 	return true, 15 * time.Second
 }
 
-func deploy_vm(ctx context.Context) {
-	vmw := &VMWDriver{name: "new-zombie-nomad-vm"}
-	_, err := vmw.cloneVM(ctx)
-	if err != nil {
-		//fmt.Printf("%v\n", err)
-	}
-}
-
 func (job *VMWDriver) cloneVM(ctx context.Context) (*object.Task, error) {
-	url, err := url.Parse("https://root:vmware@10.144.32.100/sdk")
+	hosturl, err := url.Parse(job.URL)
 
-	job.Client, err = govmomi.NewClient(ctx, url, true)
+	job.Client, err = govmomi.NewClient(ctx, hosturl, true)
 	if err != nil {
 		return nil, err
 	}
 
-	dc, err := getDatacenter(job.Client, "Lab")
+	dc, err := getDatacenter(job.Client, job.DatacenterName)
 	if err != nil {
 		return nil, err
 	}
 
 	job.Finder = find.NewFinder(job.Client.Client, true)
 	job.Finder = job.Finder.SetDatacenter(dc)
-	job.VirtualMachine, err = job.Finder.VirtualMachine(ctx, "zombie-sandbox")
+	job.VirtualMachine, err = job.Finder.VirtualMachine(ctx, job.VirtualMachineName)
 	if err != nil {
 		return nil, err
 	}
@@ -119,7 +156,7 @@ func (job *VMWDriver) cloneVM(ctx context.Context) (*object.Task, error) {
 		return nil, fmt.Errorf("No network device found.")
 	}
 
-	if job.Network, err = job.Finder.NetworkOrDefault(context.TODO(), "WDC_EXTERNAL"); err != nil {
+	if job.Network, err = job.Finder.NetworkOrDefault(context.TODO(), job.NetworkName); err != nil {
 		return nil, err
 	}
 
@@ -128,7 +165,7 @@ func (job *VMWDriver) cloneVM(ctx context.Context) (*object.Task, error) {
 		return nil, err
 	}
 
-	job.Device, err = object.EthernetCardTypes().CreateEthernetCard("e1000", backing)
+	job.Device, err = object.EthernetCardTypes().CreateEthernetCard(job.NetAdapterType, backing)
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +186,7 @@ func (job *VMWDriver) cloneVM(ctx context.Context) (*object.Task, error) {
 		return nil, err
 	}
 	folderref := job.Folder.Reference()
-	job.ResourcePool, err = ResourcePool(job.Finder, "MGMT")
+	job.ResourcePool, err = ResourcePool(job.Finder, job.RescourcePoolName)
 	if err != nil {
 		return nil, err
 	}
@@ -177,7 +214,7 @@ func (job *VMWDriver) cloneVM(ctx context.Context) (*object.Task, error) {
 	}
 
 	// get datastore
-	job.Datastore, err = Datastore(job.Finder, "automation_lab_pool_0")
+	job.Datastore, err = Datastore(job.Finder, job.DatastoreName)
 	if err != nil {
 		return nil, err
 	}
@@ -271,11 +308,10 @@ func (job *VMWDriver) cloneVM(ctx context.Context) (*object.Task, error) {
 		cloneSpec.Customization = &customSpec
 	}
 
-	// clone virtualmachine
+	// clone virtual machine
 	return job.VirtualMachine.Clone(ctx, job.Folder, job.name, *cloneSpec)
 }
 
-// getDatacenter gets datacenter object
 func getDatacenter(c *govmomi.Client, dc string) (*object.Datacenter, error) {
 	finder := find.NewFinder(c.Client, true)
 	if dc != "" {
@@ -304,10 +340,10 @@ func ResourcePool(f *find.Finder, name string) (*object.ResourcePool, error) {
 	}
 }
 
-func HostSystem(f *find.Finder) (*object.HostSystem, error) {
-	host, err := f.DefaultHostSystem(context.TODO())
-	return host, err
-}
+//func HostSystem(f *find.Finder) (*object.HostSystem, error) {
+//	host, err := f.DefaultHostSystem(context)
+//	return host, err
+//}
 
 func Datastore(f *find.Finder, name string) (*object.Datastore, error) {
 	if ds, err := f.DatastoreOrDefault(context.TODO(), name); err != nil {
@@ -316,4 +352,3 @@ func Datastore(f *find.Finder, name string) (*object.Datastore, error) {
 		return ds, nil
 	}
 }
-

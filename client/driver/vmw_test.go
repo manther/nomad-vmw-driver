@@ -3,8 +3,8 @@ package driver
 import (
 	"testing"
 
-	"github.com/hashicorp/nomad/nomad/structs"
 	ctestutils "github.com/hashicorp/nomad/client/testutil"
+	"github.com/hashicorp/nomad/nomad/structs"
 )
 
 func TestImplements_Driver_Interface(t *testing.T) {
@@ -17,6 +17,6 @@ func TestImplements_Driver_Interface(t *testing.T) {
 	}
 	_, execCtx := testDriverContexts(task)
 	defer execCtx.AllocDir.Destroy()
-//	d := NewVMWDriver(driverCtx)
+	//	d := NewVMWDriver(driverCtx)
 
 }
