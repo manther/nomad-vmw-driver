@@ -1,31 +1,32 @@
 package driver
 
 import (
-	"os"
-	"log"
-	"fmt"
-	"time"
-	"net/url"
 	"context"
-	"os/exec"
-	"path/filepath"
 	"encoding/json"
+	"fmt"
+	"github.com/hashicorp/go-plugin"
+	"github.com/hashicorp/nomad/client/allocdir"
+	"github.com/hashicorp/nomad/client/config"
+	"github.com/hashicorp/nomad/client/driver/executor"
+	dstructs "github.com/hashicorp/nomad/client/driver/structs"
+	cstructs "github.com/hashicorp/nomad/client/structs"
+	"github.com/hashicorp/nomad/helper/discover"
+	"github.com/hashicorp/nomad/helper/fields"
+	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/mitchellh/mapstructure"
 	"github.com/vmware/govmomi"
 	"github.com/vmware/govmomi/find"
-	"github.com/hashicorp/go-plugin"
 	"github.com/vmware/govmomi/object"
-	"github.com/mitchellh/mapstructure"
 	"github.com/vmware/govmomi/property"
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
-	"github.com/hashicorp/nomad/client/config"
-	"github.com/hashicorp/nomad/helper/fields"
-	"github.com/hashicorp/nomad/nomad/structs"
-	"github.com/hashicorp/nomad/client/allocdir"
-	"github.com/hashicorp/nomad/helper/discover"
-	"github.com/hashicorp/nomad/client/driver/executor"
-	cstructs "github.com/hashicorp/nomad/client/structs"
-	dstructs "github.com/hashicorp/nomad/client/driver/structs"
+	"log"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"time"
 )
 
 const (
@@ -70,6 +71,8 @@ type vmwHandle struct {
 	version        string
 	waitCh         chan *dstructs.WaitResult
 	doneCh         chan struct{}
+	gctx           context.Context
+	task           *object.Task
 }
 
 type VMWDriverConfig struct {
@@ -193,14 +196,15 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 	// for generating unique VM names with the username later
 	hosturl, err := url.Parse(vmwDriverConfig.URL)
 
+	gctx := context.TODO()
 	// Instantiate new govmomi client
-	d.Client, err = govmomi.NewClient(context.TODO(), hosturl, true)
+	d.Client, err = govmomi.NewClient(gctx, hosturl, true)
 	if err != nil {
 		return nil, err
 	}
 
 	// Grab datacenter object
-	dc, err := getDatacenter(d.Client, vmwDriverConfig.DatacenterName)
+	dc, err := getDatacenter(d.Client, vmwDriverConfig.DatacenterName, gctx)
 	if err != nil {
 		return nil, err
 	}
@@ -209,13 +213,13 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 	d.Finder = d.Finder.SetDatacenter(dc)
 
 	// Find VM to clone
-	d.VirtualMachine, err = d.Finder.VirtualMachine(context.TODO(), vmwDriverConfig.VMName)
+	d.VirtualMachine, err = d.Finder.VirtualMachine(gctx, vmwDriverConfig.VMName)
 	if err != nil {
 		return nil, err
 	}
 
 	// Search for the first network card of the source
-	devices, err := d.VirtualMachine.Device(context.TODO())
+	devices, err := d.VirtualMachine.Device(gctx)
 	if err != nil {
 		return nil, err
 	}
@@ -231,11 +235,11 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		return nil, fmt.Errorf("No network device found.")
 	}
 	//d.logger.Printf("Here2")
-	if d.Network, err = d.Finder.NetworkOrDefault(context.TODO(), vmwDriverConfig.Network); err != nil {
+	if d.Network, err = d.Finder.NetworkOrDefault(gctx, vmwDriverConfig.Network); err != nil {
 		return nil, err
 	}
 
-	backing, err := d.Network.EthernetCardBackingInfo(context.TODO())
+	backing, err := d.Network.EthernetCardBackingInfo(gctx)
 	if err != nil {
 		return nil, err
 	}
@@ -257,17 +261,16 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 	}
 
 	// Get resource pool object
-	d.Folder, err = Folder(d.Finder, "")
+	d.Folder, err = Folder(d.Finder, "", gctx)
 	if err != nil {
 		return nil, err
 	}
 	folderref := d.Folder.Reference()
-	d.ResourcePool, err = ResourcePool(d.Finder, vmwDriverConfig.Pool)
+	d.ResourcePool, err = ResourcePool(d.Finder, vmwDriverConfig.Pool, gctx)
 	if err != nil {
 		return nil, err
 	}
 	poolref := d.ResourcePool.Reference()
-
 
 	// Not doing relocates yet, but leaving in for later
 	relocateSpec := types.VirtualMachineRelocateSpec{
@@ -294,7 +297,7 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 	}
 
 	// Get datastore
-	d.Datastore, err = Datastore(d.Finder, vmwDriverConfig.DatastoreName)
+	d.Datastore, err = Datastore(d.Finder, vmwDriverConfig.DatastoreName, gctx)
 	if err != nil {
 		return nil, err
 	}
@@ -324,7 +327,7 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 
 		// Get the storage placement result
 		storageResourceManager := object.NewStorageResourceManager(d.Client.Client)
-		result, err := storageResourceManager.RecommendDatastores(context.TODO(), storagePlacementSpec)
+		result, err := storageResourceManager.RecommendDatastores(gctx, storagePlacementSpec)
 		if err != nil {
 			return nil, err
 		}
@@ -351,7 +354,7 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		vmxPath := fmt.Sprintf("%s/%s.vmx", vmwDriverConfig.Name, vmwDriverConfig.Name)
 
 		var mds mo.Datastore
-		err = property.DefaultCollector(d.Client.Client).RetrieveOne(context.TODO(), datastoreref, []string{"name"}, &mds)
+		err = property.DefaultCollector(d.Client.Client).RetrieveOne(gctx, datastoreref, []string{"name"}, &mds)
 		if err != nil {
 			return nil, err
 		}
@@ -359,7 +362,7 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		datastore := object.NewDatastore(d.Client.Client, datastoreref)
 		datastore.InventoryPath = mds.Name
 
-		_, err := datastore.Stat(context.TODO(), vmxPath)
+		_, err := datastore.Stat(gctx, vmxPath)
 		if err == nil {
 			dsPath := d.Datastore.Path(vmxPath)
 			return nil, fmt.Errorf("File %s already exists", dsPath)
@@ -370,7 +373,7 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		// get the customization spec manager
 		customizationSpecManager := object.NewCustomizationSpecManager(d.Client.Client)
 		// check if customization specification exists
-		exists, err := customizationSpecManager.DoesCustomizationSpecExist(context.TODO(), d.customization)
+		exists, err := customizationSpecManager.DoesCustomizationSpecExist(gctx, d.customization)
 		if err != nil {
 			return nil, err
 		}
@@ -378,7 +381,7 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 			return nil, fmt.Errorf("Customization specification %s does not exists.", d.customization)
 		}
 		// get the customization specification
-		customSpecItem, err := customizationSpecManager.GetCustomizationSpec(context.TODO(), d.customization)
+		customSpecItem, err := customizationSpecManager.GetCustomizationSpec(gctx, d.customization)
 		if err != nil {
 			return nil, err
 		}
@@ -419,7 +422,7 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 	}
 
 	// Clone virtual machine
-	_, err = d.VirtualMachine.Clone(context.TODO(), d.Folder, vmwDriverConfig.Name, *cloneSpec)
+	result, err := d.VirtualMachine.Clone(gctx, d.Folder, vmwDriverConfig.Name, *cloneSpec)
 	if err != nil {
 		pluginClient.Kill()
 		return nil, err
@@ -437,19 +440,25 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		version:        d.config.Version,
 		doneCh:         make(chan struct{}),
 		waitCh:         make(chan *dstructs.WaitResult, 1),
+		gctx:           gctx,
+		task:           result,
 	}
 	if err := executorPlugin.SyncServices(consulContext(d.config, "")); err != nil {
 		d.logger.Printf("[ERR] driver.vmw: error registering services with consul for task: %q: %v", task.Name, err)
 	}
-	fmt.Printf("Here")
+	fmt.Printf("Result type %v", reflect.TypeOf(result))
 	go h.run()
 	return h, nil
 }
 
 func (h *vmwHandle) run() {
-
+	fmt.Printf("Here0")
 	// TODO define a wait process
 	// Query the host to see that the VM is stood up and powered on.
+	_, err := h.task.WaitForResult(h.gctx, nil)
+	if err != nil {
+		h.logger.Printf("[ERR] driver.vmw: failed while waiting for host task to complete: %v", err)
+	}
 
 	fmt.Printf("Here1")
 	close(h.doneCh)
@@ -529,36 +538,36 @@ func (h *vmwHandle) Stats() (*cstructs.TaskResourceUsage, error) {
 	return h.executor.Stats()
 }
 
-func getDatacenter(c *govmomi.Client, dc string) (*object.Datacenter, error) {
+func getDatacenter(c *govmomi.Client, dc string, gctx context.Context) (*object.Datacenter, error) {
 	finder := find.NewFinder(c.Client, true)
 	if dc != "" {
-		d, err := finder.Datacenter(context.TODO(), dc)
+		d, err := finder.Datacenter(gctx, dc)
 		return d, err
 	} else {
-		d, err := finder.DefaultDatacenter(context.TODO())
+		d, err := finder.DefaultDatacenter(gctx)
 		return d, err
 	}
 }
 
-func Folder(finder *find.Finder, name string) (*object.Folder, error) {
+func Folder(finder *find.Finder, name string, gctx context.Context) (*object.Folder, error) {
 
-	if folder, err := finder.FolderOrDefault(context.TODO(), name); err != nil {
+	if folder, err := finder.FolderOrDefault(gctx, name); err != nil {
 		return nil, err
 	} else {
 		return folder, nil
 	}
 }
 
-func ResourcePool(f *find.Finder, name string) (*object.ResourcePool, error) {
-	if pool, err := f.ResourcePoolOrDefault(context.TODO(), name); err != nil {
+func ResourcePool(f *find.Finder, name string, gctx context.Context) (*object.ResourcePool, error) {
+	if pool, err := f.ResourcePoolOrDefault(gctx, name); err != nil {
 		return nil, err
 	} else {
 		return pool, nil
 	}
 }
 
-func Datastore(f *find.Finder, name string) (*object.Datastore, error) {
-	if ds, err := f.DatastoreOrDefault(context.TODO(), name); err != nil {
+func Datastore(f *find.Finder, name string, gctx context.Context) (*object.Datastore, error) {
+	if ds, err := f.DatastoreOrDefault(gctx, name); err != nil {
 		return nil, err
 	} else {
 		return ds, nil
