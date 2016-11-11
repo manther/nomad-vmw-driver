@@ -466,7 +466,7 @@ func (h *vmwHandle) ID() string {
 
 	data, err := json.Marshal(id)
 	if err != nil {
-		h.logger.Printf("[ERR] driver.qemu: failed to marshal ID to JSON: %s", err)
+		h.logger.Printf("[ERR] driver.vmw: failed to marshal ID to JSON: %s", err)
 	}
 	return string(data)
 }
