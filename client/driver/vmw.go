@@ -2,12 +2,14 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"github.com/hashicorp/go-plugin"
 	"github.com/hashicorp/nomad/client/allocdir"
 	"github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/client/driver/executor"
 	dstructs "github.com/hashicorp/nomad/client/driver/structs"
+	cstructs "github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/helper/discover"
 	"github.com/hashicorp/nomad/helper/fields"
 	"github.com/hashicorp/nomad/nomad/structs"
@@ -23,7 +25,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"syscall"
 	"time"
 )
 
@@ -59,8 +60,8 @@ type VMWDriver struct {
 
 // vmwHandle is returned from Start/Open as a handle to the PID
 type vmwHandle struct {
-	pluginClient *plugin.Client
-	//userPid        int
+	pluginClient   *plugin.Client
+	vmName         string
 	executor       executor.Executor
 	allocDir       *allocdir.AllocDir
 	killTimeout    time.Duration
@@ -81,6 +82,14 @@ type VMWDriverConfig struct {
 	DatastoreName  string `mapstructure:"datastore"`
 	Pool           string `mapstructure:"pool"`
 	NetAdapterType string `mapstructure:"netadapter"`
+}
+
+type vmwId struct {
+	VMName         string
+	PluginConfig   *PluginReattachConfig
+	AllocDir       *allocdir.AllocDir
+	KillTimeout    time.Duration
+	MaxKillTimeout time.Duration
 }
 
 func NewVMWDriver(ctx *DriverContext) Driver {
@@ -154,7 +163,7 @@ func (d *VMWDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, e
 }
 
 func (d *VMWDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
-	_, err := d.cloneVM(ctx, task)
+	_, err := d.CloneVM(ctx, task)
 	if err != nil {
 		d.logger.Printf("[ERR] Error deploying VM. Task: %s. Error: %s", task.Name, err)
 		return nil, err
@@ -172,21 +181,12 @@ func (d *VMWDriver) Periodic() (bool, time.Duration) {
 	return true, 15 * time.Second
 }
 
-func (d *VMWDriver) cloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
+func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
 	//d.logger.Printf("Here1")
 	vmwDriverConfig, err := NewVMWDriverConfig(task)
 	if err != nil {
 		return nil, err
 	}
-
-	fmt.Printf("Here5: %v", ctx.AllocDir.TaskDirs)
-	fmt.Printf("Here5: %v", d.DriverContext.taskName)
-
-	taskDir, ok := ctx.AllocDir.TaskDirs[d.DriverContext.taskName]
-	if !ok {
-		return nil, fmt.Errorf("Could not find task directory for task: %v", d.DriverContext.taskName)
-	}
-	fmt.Printf("Here5: %v", taskDir)
 
 	hosturl, err := url.Parse(vmwDriverConfig.URL)
 
@@ -353,7 +353,6 @@ func (d *VMWDriver) cloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 			return nil, fmt.Errorf("File %s already exists", dsPath)
 		}
 	}
-	//d.logger.Printf("Here4")
 	// check if customization specification requested
 	if len(d.customization) > 0 {
 		// get the customization spec manager
@@ -376,13 +375,10 @@ func (d *VMWDriver) cloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		cloneSpec.Customization = &customSpec
 	}
 
-	//fmt.Printf("Here5: %v", ctx.AllocDir.TaskDirs)
-	//fmt.Printf("Here5: %v", d.DriverContext.taskName)
-
-	//taskDir, ok := ctx.AllocDir.TaskDirs[d.DriverContext.taskName]
-	//if !ok {
-	//	return nil, fmt.Errorf("Could not find task directory for task: %v", d.DriverContext.taskName)
-	//}
+	taskDir, ok := ctx.AllocDir.TaskDirs[d.DriverContext.taskName]
+	if !ok {
+		return nil, fmt.Errorf("Could not find task directory for task: %v", d.DriverContext.taskName)
+	}
 
 	bin, err := discover.NomadExecutable()
 	if err != nil {
@@ -393,20 +389,18 @@ func (d *VMWDriver) cloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		Cmd: exec.Command(bin, "executor", pluginLogFile),
 	}
 
-	exec, pluginClient, err := createExecutor(pluginConfig, d.config.LogOutput, d.config)
+	executorPlugin, pluginClient, err := createExecutor(pluginConfig, d.config.LogOutput, d.config)
 	if err != nil {
 		return nil, err
 	}
 	executorCtx := &executor.ExecutorContext{
-		TaskEnv:        d.taskEnv,
-		Task:           task,
-		Driver:         "vmw",
-		AllocDir:       ctx.AllocDir,
-		AllocID:        ctx.AllocID,
-		PortLowerBound: d.config.ClientMinPort,
-		PortUpperBound: d.config.ClientMaxPort,
+		TaskEnv:  d.taskEnv,
+		Task:     task,
+		Driver:   "vmw",
+		AllocDir: ctx.AllocDir,
+		AllocID:  ctx.AllocID,
 	}
-	if err := exec.SetContext(executorCtx); err != nil {
+	if err := executorPlugin.SetContext(executorCtx); err != nil {
 		pluginClient.Kill()
 		return nil, fmt.Errorf("failed to set executor context: %v", err)
 	}
@@ -422,7 +416,7 @@ func (d *VMWDriver) cloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 	maxKill := d.DriverContext.config.MaxKillTimeout
 	h := &vmwHandle{
 		pluginClient:   pluginClient,
-		executor:       exec,
+		executor:       executorPlugin,
 		allocDir:       ctx.AllocDir,
 		killTimeout:    GetKillTimeout(task.KillTimeout, maxKill),
 		maxKillTimeout: maxKill,
@@ -431,33 +425,94 @@ func (d *VMWDriver) cloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		doneCh:         make(chan struct{}),
 		waitCh:         make(chan *dstructs.WaitResult, 1),
 	}
-	if err := exec.SyncServices(consulContext(d.config, "")); err != nil {
+	if err := executorPlugin.SyncServices(consulContext(d.config, "")); err != nil {
 		d.logger.Printf("[ERR] driver.vmw: error registering services with consul for task: %q: %v", task.Name, err)
 	}
+	fmt.Printf("Here")
 	go h.run()
 	return h, nil
 }
 
 func (h *vmwHandle) run() {
-	ps, err := h.executor.Wait()
-	if ps.ExitCode == 0 && err != nil {
-		//if e := killProcess(h.userPid); e != nil {
-		//	h.logger.Printf("[ERR] driver.qemu: error killing user process: %v", e)
-		//}
-		//if e := h.allocDir.UnmountAll(); e != nil {
-		//	h.logger.Printf("[ERR] driver.qemu: unmounting dev,proc and alloc dirs failed: %v", e)
-		//}
-	}
+
+	//TODO define a wait process
+
+	fmt.Printf("Here1")
 	close(h.doneCh)
-	h.waitCh <- &dstructs.WaitResult{ExitCode: ps.ExitCode, Signal: ps.Signal, Err: err}
+	h.waitCh <- dstructs.NewWaitResult(0, 0, nil)
 	close(h.waitCh)
+
 	// Remove services
+	fmt.Printf("Here2")
 	if err := h.executor.DeregisterServices(); err != nil {
 		h.logger.Printf("[ERR] driver.vmw: failed to deregister services: %v", err)
 	}
-
-	h.executor.Exit()
+	fmt.Printf("Here3")
+	if err := h.executor.Exit(); err != nil {
+		h.logger.Printf("[ERR] driver.vmw: failed to exit: %v", err)
+	}
+	fmt.Printf("Here4")
 	h.pluginClient.Kill()
+}
+
+func (h *vmwHandle) ID() string {
+	id := vmwId{
+		VMName:         h.vmName,
+		KillTimeout:    h.killTimeout,
+		MaxKillTimeout: h.maxKillTimeout,
+		PluginConfig:   NewPluginReattachConfig(h.pluginClient.ReattachConfig()),
+		AllocDir:       h.allocDir,
+	}
+
+	data, err := json.Marshal(id)
+	if err != nil {
+		h.logger.Printf("[ERR] driver.qemu: failed to marshal ID to JSON: %s", err)
+	}
+	return string(data)
+}
+
+func (h *vmwHandle) WaitCh() chan *dstructs.WaitResult {
+	return h.waitCh
+}
+
+func (h *vmwHandle) Update(task *structs.Task) error {
+	// Store the updated kill timeout.
+	h.killTimeout = GetKillTimeout(task.KillTimeout, h.maxKillTimeout)
+	h.executor.UpdateTask(task)
+
+	// Update is not possible
+	return nil
+}
+
+func (h *vmwHandle) Signal(s os.Signal) error {
+	return fmt.Errorf("VMW driver can't send signals")
+}
+
+func (h *vmwHandle) Kill() error {
+	if err := h.executor.ShutDown(); err != nil {
+		if h.pluginClient.Exited() {
+			return nil
+		}
+		return fmt.Errorf("executor Shutdown failed: %v", err)
+	}
+
+	select {
+	case <-h.doneCh:
+		return nil
+	case <-time.After(h.killTimeout):
+		if h.pluginClient.Exited() {
+			return nil
+		}
+		if err := h.executor.Exit(); err != nil {
+			return fmt.Errorf("executor Exit failed: %v", err)
+		}
+
+		return nil
+	}
+}
+
+func (h *vmwHandle) Stats() (*cstructs.TaskResourceUsage, error) {
+	return h.executor.Stats()
 }
 
 func getDatacenter(c *govmomi.Client, dc string) (*object.Datacenter, error) {
@@ -488,11 +543,6 @@ func ResourcePool(f *find.Finder, name string) (*object.ResourcePool, error) {
 	}
 }
 
-//func HostSystem(f *find.Finder) (*object.HostSystem, error) {
-//	host, err := f.DefaultHostSystem(context)
-//	return host, err
-//}
-
 func Datastore(f *find.Finder, name string) (*object.Datastore, error) {
 	if ds, err := f.DatastoreOrDefault(context.TODO(), name); err != nil {
 		return nil, err
@@ -500,3 +550,8 @@ func Datastore(f *find.Finder, name string) (*object.Datastore, error) {
 		return ds, nil
 	}
 }
+
+//func HostSystem(f *find.Finder) (*object.HostSystem, error) {
+//	host, err := f.DefaultHostSystem(context)
+//	return host, err
+//}
