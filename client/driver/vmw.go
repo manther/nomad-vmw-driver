@@ -188,13 +188,18 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		return nil, err
 	}
 
+	// ESXi of VSphere Host URL
+	// TODO take URL and user, pass separately
+	// for generating unique VM names with the username later
 	hosturl, err := url.Parse(vmwDriverConfig.URL)
 
+	// Instantiate new govmomi client
 	d.Client, err = govmomi.NewClient(context.TODO(), hosturl, true)
 	if err != nil {
 		return nil, err
 	}
 
+	// Grab datacenter object
 	dc, err := getDatacenter(d.Client, vmwDriverConfig.DatacenterName)
 	if err != nil {
 		return nil, err
@@ -202,12 +207,14 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 
 	d.Finder = find.NewFinder(d.Client.Client, true)
 	d.Finder = d.Finder.SetDatacenter(dc)
+
+	// Find VM to clone
 	d.VirtualMachine, err = d.Finder.VirtualMachine(context.TODO(), vmwDriverConfig.VMName)
 	if err != nil {
 		return nil, err
 	}
 
-	// search for the first network card of the source
+	// Search for the first network card of the source
 	devices, err := d.VirtualMachine.Device(context.TODO())
 	if err != nil {
 		return nil, err
@@ -238,10 +245,10 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		return nil, err
 	}
 
-	//set backing info
+	// Set backing info
 	card.Backing = d.Device.(types.BaseVirtualEthernetCard).GetVirtualEthernetCard().Backing
 
-	// prepare virtual device config spec for network card
+	// Prepare virtual device config spec for network card
 	configSpecs := []types.BaseVirtualDeviceConfigSpec{
 		&types.VirtualDeviceConfigSpec{
 			Operation: types.VirtualDeviceConfigSpecOperationEdit,
@@ -249,6 +256,7 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		},
 	}
 
+	// Get resource pool object
 	d.Folder, err = Folder(d.Finder, "")
 	if err != nil {
 		return nil, err
@@ -260,12 +268,15 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 	}
 	poolref := d.ResourcePool.Reference()
 
+
+	// Not doing relocates yet, but leaving in for later
 	relocateSpec := types.VirtualMachineRelocateSpec{
 		DeviceChange: configSpecs,
 		Folder:       &folderref,
 		Pool:         &poolref,
 	}
 
+	// TODO
 	//cmd.HostSystem, err = HostSystem(cmd.Finder)
 	//if err != nil {
 	//	return nil, err
@@ -274,20 +285,21 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		hostref := d.HostSystem.Reference()
 		relocateSpec.Host = &hostref
 	}
-	//d.logger.Printf("Here3")
+
+	// Pulling clone specifications
 	cloneSpec := &types.VirtualMachineCloneSpec{
 		Location: relocateSpec,
 		PowerOn:  false,
 		Template: d.template,
 	}
 
-	// get datastore
+	// Get datastore
 	d.Datastore, err = Datastore(d.Finder, vmwDriverConfig.DatastoreName)
 	if err != nil {
 		return nil, err
 	}
 
-	// clone to storage pod
+	// Clone to storage pod
 	datastoreref := types.ManagedObjectReference{}
 	if d.StoragePod != nil && d.Datastore == nil {
 		storagePod := d.StoragePod.Reference()
@@ -375,6 +387,7 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		cloneSpec.Customization = &customSpec
 	}
 
+	// Setup Nomad executable
 	taskDir, ok := ctx.AllocDir.TaskDirs[d.DriverContext.taskName]
 	if !ok {
 		return nil, fmt.Errorf("Could not find task directory for task: %v", d.DriverContext.taskName)
@@ -405,7 +418,7 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		return nil, fmt.Errorf("failed to set executor context: %v", err)
 	}
 
-	// clone virtual machine
+	// Clone virtual machine
 	_, err = d.VirtualMachine.Clone(context.TODO(), d.Folder, vmwDriverConfig.Name, *cloneSpec)
 	if err != nil {
 		pluginClient.Kill()
@@ -435,7 +448,8 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 
 func (h *vmwHandle) run() {
 
-	//TODO define a wait process
+	// TODO define a wait process
+	// Query the host to see that the VM is stood up and powered on.
 
 	fmt.Printf("Here1")
 	close(h.doneCh)
