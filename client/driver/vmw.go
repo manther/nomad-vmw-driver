@@ -25,7 +25,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"time"
 )
 
@@ -67,12 +66,12 @@ type vmwHandle struct {
 	allocDir       *allocdir.AllocDir
 	killTimeout    time.Duration
 	maxKillTimeout time.Duration
-	logger         *log.Logger
+	logger         log.Logger
 	version        string
 	waitCh         chan *dstructs.WaitResult
 	doneCh         chan struct{}
-	gctx           context.Context
-	task           *object.Task
+	vmInfoCh       chan *types.TaskInfo
+	taskCh         chan *object.Task
 }
 
 type VMWDriverConfig struct {
@@ -196,7 +195,7 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 	// for generating unique VM names with the username later
 	hosturl, err := url.Parse(vmwDriverConfig.URL)
 
-	gctx := context.TODO()
+	gctx := context.Background()
 	// Instantiate new govmomi client
 	d.Client, err = govmomi.NewClient(gctx, hosturl, true)
 	if err != nil {
@@ -421,12 +420,17 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		return nil, fmt.Errorf("failed to set executor context: %v", err)
 	}
 
+	fmt.Printf("Cloning")
 	// Clone virtual machine
-	result, err := d.VirtualMachine.Clone(gctx, d.Folder, vmwDriverConfig.Name, *cloneSpec)
+	vmTask, err := d.VirtualMachine.Clone(gctx, d.Folder, vmwDriverConfig.Name, *cloneSpec)
 	if err != nil {
 		pluginClient.Kill()
 		return nil, err
 	}
+
+	fmt.Printf("Initializing channels")
+	vmInfoCh := make(chan *types.TaskInfo)
+	taskCH := make(chan *object.Task)
 
 	// Return a driver handle
 	maxKill := d.DriverContext.config.MaxKillTimeout
@@ -436,31 +440,40 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		allocDir:       ctx.AllocDir,
 		killTimeout:    GetKillTimeout(task.KillTimeout, maxKill),
 		maxKillTimeout: maxKill,
-		logger:         d.logger,
+		logger:         *d.logger,
 		version:        d.config.Version,
 		doneCh:         make(chan struct{}),
 		waitCh:         make(chan *dstructs.WaitResult, 1),
-		gctx:           gctx,
-		task:           result,
+		vmInfoCh:       vmInfoCh,
+		taskCh:         taskCH,
 	}
 	if err := executorPlugin.SyncServices(consulContext(d.config, "")); err != nil {
 		d.logger.Printf("[ERR] driver.vmw: error registering services with consul for task: %q: %v", task.Name, err)
 	}
-	fmt.Printf("Result type %v", reflect.TypeOf(result))
+
+	fmt.Printf("Running")
 	go h.run()
+
+	fmt.Printf("Waiting")
+	go func(infoCh chan *types.TaskInfo, taskCh chan *object.Task) {
+		fmt.Printf("In Waiting anon func")
+		task := <-taskCH
+		vmInfo, err := task.WaitForResult(context.Background(), nil)
+		if err != nil {
+			fmt.Printf("[ERR] driver.vmw: failed while waiting for host task to complete: %v", err)
+		}
+		infoCh <- vmInfo
+	}(vmInfoCh, taskCH)
+	taskCH <- vmTask
 	return h, nil
 }
 
 func (h *vmwHandle) run() {
-	fmt.Printf("Here0")
-	// TODO define a wait process
-	// Query the host to see that the VM is stood up and powered on.
-	_, err := h.task.WaitForResult(h.gctx, nil)
-	if err != nil {
-		h.logger.Printf("[ERR] driver.vmw: failed while waiting for host task to complete: %v", err)
-	}
+	// Wait for clone to finish
+	h.logger.Printf("Wating in run.")
+	vmInfo := <-h.vmInfoCh
+	fmt.Printf("Finished waiting in run: %v", vmInfo)
 
-	fmt.Printf("Here1")
 	close(h.doneCh)
 	h.waitCh <- dstructs.NewWaitResult(0, 0, nil)
 	close(h.waitCh)
@@ -468,11 +481,11 @@ func (h *vmwHandle) run() {
 	// Remove services
 	fmt.Printf("Here2")
 	if err := h.executor.DeregisterServices(); err != nil {
-		h.logger.Printf("[ERR] driver.vmw: failed to deregister services: %v", err)
+		fmt.Printf("[ERR] driver.vmw: failed to deregister services: %v", err)
 	}
 	fmt.Printf("Here3")
 	if err := h.executor.Exit(); err != nil {
-		h.logger.Printf("[ERR] driver.vmw: failed to exit: %v", err)
+		fmt.Printf("[ERR] driver.vmw: failed to exit: %v", err)
 	}
 	fmt.Printf("Here4")
 	h.pluginClient.Kill()
