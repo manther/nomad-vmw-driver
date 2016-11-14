@@ -70,8 +70,8 @@ type vmwHandle struct {
 	version        string
 	waitCh         chan *dstructs.WaitResult
 	doneCh         chan struct{}
-	vmInfoCh       chan *types.TaskInfo
-	taskCh         chan *object.Task
+	//vmInfoCh       chan *types.TaskInfo
+	taskCh chan *object.Task
 }
 
 type VMWDriverConfig struct {
@@ -165,13 +165,15 @@ func (d *VMWDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, e
 }
 
 func (d *VMWDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
+	// TODO think about wrapping in a waitgroup to solve govmomi task nil pointer
 	_, err := d.CloneVM(ctx, task)
 	if err != nil {
-		d.logger.Printf("[ERR] Error deploying VM. Task: %s. Error: %s", task.Name, err)
+		d.logger.Printf("[ERR] Error issuing VM clone command. Task: %s. Error: %s", task.Name, err)
 		return nil, err
 	} else {
-		d.logger.Printf("[INFO] Task: %s VM deployed successfully!", task.Name)
+		d.logger.Printf("[INFO] Task: %s VM clone command issued successfully!", task.Name)
 	}
+
 	return nil, nil
 }
 
@@ -184,7 +186,7 @@ func (d *VMWDriver) Periodic() (bool, time.Duration) {
 }
 
 func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
-	//d.logger.Printf("Here1")
+	//d.logger.Printf("Here1")	//  TODO remove
 	vmwDriverConfig, err := NewVMWDriverConfig(task)
 	if err != nil {
 		return nil, err
@@ -420,7 +422,7 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		return nil, fmt.Errorf("failed to set executor context: %v", err)
 	}
 
-	fmt.Printf("Cloning")
+	fmt.Printf("Cloning")	// TODO remove
 	// Clone virtual machine
 	vmTask, err := d.VirtualMachine.Clone(gctx, d.Folder, vmwDriverConfig.Name, *cloneSpec)
 	if err != nil {
@@ -428,8 +430,8 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		return nil, err
 	}
 
-	fmt.Printf("Initializing channels")
-	vmInfoCh := make(chan *types.TaskInfo)
+	fmt.Printf("Initializing channels") // TODO remove
+	//vmInfoCh := make(chan *types.TaskInfo)
 	taskCH := make(chan *object.Task)
 
 	// Return a driver handle
@@ -444,50 +446,44 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		version:        d.config.Version,
 		doneCh:         make(chan struct{}),
 		waitCh:         make(chan *dstructs.WaitResult, 1),
-		vmInfoCh:       vmInfoCh,
-		taskCh:         taskCH,
+		//vmInfoCh:       vmInfoCh,
+		taskCh: taskCH,
 	}
 	if err := executorPlugin.SyncServices(consulContext(d.config, "")); err != nil {
 		d.logger.Printf("[ERR] driver.vmw: error registering services with consul for task: %q: %v", task.Name, err)
 	}
 
-	fmt.Printf("Running")
+	taskCH <- vmTask 	// TODO, want this below the h.run(), but it crashes everytime.
+
+	fmt.Printf("Running")	// TODO remove
 	go h.run()
 
-	fmt.Printf("Waiting")
-	go func(infoCh chan *types.TaskInfo, taskCh chan *object.Task) {
-		fmt.Printf("In Waiting anon func")
-		task := <-taskCH
-		vmInfo, err := task.WaitForResult(context.Background(), nil)
-		if err != nil {
-			fmt.Printf("[ERR] driver.vmw: failed while waiting for host task to complete: %v", err)
-		}
-		infoCh <- vmInfo
-	}(vmInfoCh, taskCH)
-	taskCH <- vmTask
 	return h, nil
 }
 
 func (h *vmwHandle) run() {
 	// Wait for clone to finish
-	h.logger.Printf("Wating in run.")
-	vmInfo := <-h.vmInfoCh
-	fmt.Printf("Finished waiting in run: %v", vmInfo)
+	fmt.Printf("Wating in run.")	// TODO remove
+	task := <-h.taskCh
+	defer task.WaitForResult(context.Background(), nil)
+	fmt.Printf("Finished waiting in run") // TODO remove
+
+	// TODO receive the vminfo var and report back the ip address, name etc of the deployed VM
 
 	close(h.doneCh)
 	h.waitCh <- dstructs.NewWaitResult(0, 0, nil)
 	close(h.waitCh)
 
 	// Remove services
-	fmt.Printf("Here2")
+	fmt.Printf("Here2")	// TODO remove
 	if err := h.executor.DeregisterServices(); err != nil {
 		fmt.Printf("[ERR] driver.vmw: failed to deregister services: %v", err)
 	}
-	fmt.Printf("Here3")
+	fmt.Printf("Here3")	// TODO remove
 	if err := h.executor.Exit(); err != nil {
 		fmt.Printf("[ERR] driver.vmw: failed to exit: %v", err)
 	}
-	fmt.Printf("Here4")
+	fmt.Printf("Here4")	// TODO remove
 	h.pluginClient.Kill()
 }
 
