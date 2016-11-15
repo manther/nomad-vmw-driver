@@ -18,6 +18,7 @@ import (
 	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/property"
+	"github.com/vmware/govmomi/vim25"
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
 	"log"
@@ -71,6 +72,7 @@ type vmwHandle struct {
 	waitCh         chan *dstructs.WaitResult
 	doneCh         chan struct{}
 	task           object.Task
+	client         *vim25.Client
 }
 
 type VMWDriverConfig struct {
@@ -83,6 +85,10 @@ type VMWDriverConfig struct {
 	DatastoreName  string `mapstructure:"datastore"`
 	Pool           string `mapstructure:"pool"`
 	NetAdapterType string `mapstructure:"netadapter"`
+	PowerOn        bool   `mapstructure:"poweron"`
+	Username       string `mapstructure:"username"`
+	Password       string `mapstructure:"password"`
+	GenUniqueName  bool   `mapstructure:"genuniquename"`
 }
 
 type vmwId struct {
@@ -114,28 +120,48 @@ func (c *VMWDriver) Validate(config map[string]interface{}) error {
 				Required: true,
 			},
 			"url": &fields.FieldSchema{
-				Type: fields.TypeString,
+				Type:     fields.TypeString,
+				Required: true,
 			},
 			"datacenter": &fields.FieldSchema{
-				Type: fields.TypeString,
+				Type:     fields.TypeString,
+				Required: true,
 			},
 			"vmname": &fields.FieldSchema{
-				Type: fields.TypeString,
+				Type:     fields.TypeString,
+				Required: true,
 			},
 			"network": &fields.FieldSchema{
-				Type: fields.TypeString,
+				Type:     fields.TypeString,
+				Required: true,
 			},
 			"insecure": &fields.FieldSchema{
-				Type: fields.TypeBool,
+				Type:     fields.TypeBool,
+				Required: true,
 			},
 			"datastore": &fields.FieldSchema{
-				Type: fields.TypeString,
+				Type:     fields.TypeString,
+				Required: true,
 			},
 			"pool": &fields.FieldSchema{
-				Type: fields.TypeString,
+				Type:     fields.TypeString,
+				Required: true,
 			},
 			"netadapter": &fields.FieldSchema{
-				Type: fields.TypeString,
+				Type:     fields.TypeString,
+				Required: true,
+			},
+			"poweron": &fields.FieldSchema{
+				Type:     fields.TypeBool,
+				Required: false,
+			},
+			"username": &fields.FieldSchema{
+				Type:     fields.TypeString,
+				Required: false,
+			},
+			"password": &fields.FieldSchema{
+				Type:     fields.TypeString,
+				Required: false,
 			},
 		},
 	}
@@ -421,6 +447,10 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		return nil, fmt.Errorf("failed to set executor context: %v", err)
 	}
 
+	if vmwDriverConfig.GenUniqueName {
+		// TODO Gen unique name possibly using 	vmwDriverConfig.Name + username + uid
+	}
+
 	// Clone virtual machine
 	vmTask, err := d.VirtualMachine.Clone(gctx, d.Folder, vmwDriverConfig.Name, *cloneSpec)
 	if err != nil {
@@ -441,6 +471,7 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		doneCh:         make(chan struct{}),
 		waitCh:         make(chan *dstructs.WaitResult, 1),
 		task:           *vmTask,
+		client:         d.Client.Client,
 	}
 	if err := executorPlugin.SyncServices(consulContext(d.config, "")); err != nil {
 		d.logger.Printf("[ERR] driver.vmw: error registering services with consul for task: %q: %v", task.Name, err)
@@ -457,7 +488,25 @@ func (h *vmwHandle) run() {
 	if err != nil {
 		h.logger.Printf("[ERR] driver.vmw: Error issuing cloning VM. Error: %v", err)
 	} else {
-		h.logger.Printf("[INFO] driver.vmw: VM clone successful! VM info: %v", vmInfo)
+		vm := object.NewVirtualMachine(h.client, vmInfo.Result.(types.ManagedObjectReference))
+		h.logger.Printf("[INFO] driver.vmw: VM cloned.")
+		h.logger.Printf("[INFO] driver.vmw: Powering on VM, and waiting for result.")
+		taskPowerOn, err := vm.PowerOn(context.TODO())
+		if err != nil {
+			h.logger.Printf("[ERR] driver.vmw: Error issuing powering on command for VM. Error: %v", err)
+		}
+
+		_, err = taskPowerOn.WaitForResult(context.TODO(), nil)
+		if err != nil {
+			h.logger.Printf("[ERR] driver.vmw: Error powering on VM. Error: %v", err)
+		}
+
+		h.logger.Printf("[INFO] driver.vmw: VM powered on! Waiting for IP address.")
+		_, err = vm.WaitForIP(context.TODO())
+		if err != nil {
+			h.logger.Printf("[ERR] driver.vmw: Error waiting for IP address for VM. Error: %v", err)
+		}
+		h.logger.Printf("[INFO] driver.vmw: VM deployment successful! VM info: %v", vmInfo)
 	}
 
 	close(h.doneCh)
