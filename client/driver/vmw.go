@@ -89,6 +89,7 @@ type VMWDriverConfig struct {
 	Username       string `mapstructure:"username"`
 	Password       string `mapstructure:"password"`
 	GenUniqueName  bool   `mapstructure:"genuniquename"`
+	Folder         string `mapstructure:"folder"`
 }
 
 type vmwId struct {
@@ -160,6 +161,14 @@ func (c *VMWDriver) Validate(config map[string]interface{}) error {
 				Required: false,
 			},
 			"password": &fields.FieldSchema{
+				Type:     fields.TypeString,
+				Required: false,
+			},
+			"genuniquename": &fields.FieldSchema{
+				Type:     fields.TypeBool,
+				Required: false,
+			},
+			"folder": &fields.FieldSchema{
 				Type:     fields.TypeString,
 				Required: false,
 			},
@@ -260,7 +269,7 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 	if card == nil {
 		return nil, fmt.Errorf("No network device found.")
 	}
-	//d.logger.Printf("Here2")
+
 	if d.Network, err = d.Finder.NetworkOrDefault(gctx, vmwDriverConfig.Network); err != nil {
 		return nil, err
 	}
@@ -287,7 +296,7 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 	}
 
 	// Get resource pool object
-	d.Folder, err = Folder(d.Finder, "", gctx)
+	d.Folder, err = Folder(d.Finder, vmwDriverConfig.Folder, gctx)
 	if err != nil {
 		return nil, err
 	}
@@ -502,11 +511,11 @@ func (h *vmwHandle) run() {
 		}
 
 		h.logger.Printf("[INFO] driver.vmw: VM powered on! Waiting for IP address.")
-		_, err = vm.WaitForIP(context.TODO())
+		finalInfo, err := vm.WaitForIP(context.TODO())
 		if err != nil {
 			h.logger.Printf("[ERR] driver.vmw: Error waiting for IP address for VM. Error: %v", err)
 		}
-		h.logger.Printf("[INFO] driver.vmw: VM deployment successful! VM info: %v", vmInfo)
+		h.logger.Printf("[INFO] driver.vmw: VM deployment successful! VM info: %+v", finalInfo)
 	}
 
 	close(h.doneCh)
@@ -583,36 +592,35 @@ func (h *vmwHandle) Stats() (*cstructs.TaskResourceUsage, error) {
 	return h.executor.Stats()
 }
 
-func getDatacenter(c *govmomi.Client, dc string, gctx context.Context) (*object.Datacenter, error) {
+func getDatacenter(c *govmomi.Client, dc string, ctx context.Context) (*object.Datacenter, error) {
 	finder := find.NewFinder(c.Client, true)
 	if dc != "" {
-		d, err := finder.Datacenter(gctx, dc)
+		d, err := finder.Datacenter(ctx, dc)
 		return d, err
 	} else {
-		d, err := finder.DefaultDatacenter(gctx)
+		d, err := finder.DefaultDatacenter(ctx)
 		return d, err
 	}
 }
 
-func Folder(finder *find.Finder, name string, gctx context.Context) (*object.Folder, error) {
-
-	if folder, err := finder.FolderOrDefault(gctx, name); err != nil {
+func Folder(finder *find.Finder, name string, ctx context.Context) (*object.Folder, error) {
+	if folder, err := finder.FolderOrDefault(ctx, name); err != nil {
 		return nil, err
 	} else {
 		return folder, nil
 	}
 }
 
-func ResourcePool(f *find.Finder, name string, gctx context.Context) (*object.ResourcePool, error) {
-	if pool, err := f.ResourcePoolOrDefault(gctx, name); err != nil {
+func ResourcePool(f *find.Finder, name string, ctx context.Context) (*object.ResourcePool, error) {
+	if pool, err := f.ResourcePoolOrDefault(ctx, name); err != nil {
 		return nil, err
 	} else {
 		return pool, nil
 	}
 }
 
-func Datastore(f *find.Finder, name string, gctx context.Context) (*object.Datastore, error) {
-	if ds, err := f.DatastoreOrDefault(gctx, name); err != nil {
+func Datastore(f *find.Finder, name string, ctx context.Context) (*object.Datastore, error) {
+	if ds, err := f.DatastoreOrDefault(ctx, name); err != nil {
 		return nil, err
 	} else {
 		return ds, nil
