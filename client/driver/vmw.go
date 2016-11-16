@@ -27,6 +27,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"time"
+	//"github.com/vmware/govmomi/govc/vm"
+	//"github.com/vmware/govmomi/task"
 )
 
 const (
@@ -73,13 +75,15 @@ type vmwHandle struct {
 	doneCh         chan struct{}
 	task           object.Task
 	client         *vim25.Client
+	vm             *object.VirtualMachine
+	resourceUsage  *cstructs.TaskResourceUsage
 }
 
 type VMWDriverConfig struct {
 	Name           string `mapstructure:"name"`
 	URL            string `mapstructure:"url"`
 	DatacenterName string `mapstructure:"datacenter"`
-	VMName         string `mapstructure:"vmname"`
+	VMPath         string `mapstructure:"vmpath"`
 	Network        string `mapstructure:"network"`
 	Insecure       string `mapstructure:"insecure"`
 	DatastoreName  string `mapstructure:"datastore"`
@@ -128,7 +132,7 @@ func (c *VMWDriver) Validate(config map[string]interface{}) error {
 				Type:     fields.TypeString,
 				Required: true,
 			},
-			"vmname": &fields.FieldSchema{
+			"vmpath": &fields.FieldSchema{
 				Type:     fields.TypeString,
 				Required: true,
 			},
@@ -199,12 +203,13 @@ func (d *VMWDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, e
 }
 
 func (d *VMWDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
+	// TODO look at env vars for API url port
 	handle, err := d.CloneVM(ctx, task)
 	if err != nil {
 		d.logger.Printf("[ERR] driver.vmw: Error issuing VM clone command. Task: %s. Error: %v", task.Name, err)
 		return handle, err
 	} else {
-		d.logger.Printf("[INFO] driver.vmw: VM clone command issued successfully! Task name : %s", task.Name)
+		d.logger.Printf("[INFO] driver.vmw: VM clone command issued successfully. Task name : %s", task.Name)
 	}
 
 	return handle, nil
@@ -248,7 +253,7 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 	d.Finder = d.Finder.SetDatacenter(dc)
 
 	// Find VM to clone
-	d.VirtualMachine, err = d.Finder.VirtualMachine(gctx, vmwDriverConfig.VMName)
+	d.VirtualMachine, err = d.Finder.VirtualMachine(gctx, vmwDriverConfig.VMPath)
 	if err != nil {
 		return nil, err
 	}
@@ -295,12 +300,14 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		},
 	}
 
-	// Get resource pool object
+	// Get Folder
 	d.Folder, err = Folder(d.Finder, vmwDriverConfig.Folder, gctx)
 	if err != nil {
 		return nil, err
 	}
 	folderref := d.Folder.Reference()
+
+	// Get resource pool object
 	d.ResourcePool, err = ResourcePool(d.Finder, vmwDriverConfig.Pool, gctx)
 	if err != nil {
 		return nil, err
@@ -324,11 +331,15 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		relocateSpec.Host = &hostref
 	}
 
-	// Pulling clone specifications
+	// Setting clone specifications
 	cloneSpec := &types.VirtualMachineCloneSpec{
 		Location: relocateSpec,
 		PowerOn:  false,
 		Template: d.template,
+		Config: &types.VirtualMachineConfigSpec{
+			CpuAllocation:    d.GetResourceAllocationInfo(int32(task.Resources.CPU)),
+			MemoryAllocation: d.GetResourceAllocationInfo(int32(task.Resources.MemoryMB)),
+		},
 	}
 
 	// Get datastore
@@ -461,6 +472,7 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 	}
 
 	// Clone virtual machine
+	d.logger.Printf("[INFO] driver.vmw: clone spec %v", cloneSpec)
 	vmTask, err := d.VirtualMachine.Clone(gctx, d.Folder, vmwDriverConfig.Name, *cloneSpec)
 	if err != nil {
 		pluginClient.Kill()
@@ -491,31 +503,42 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 	return h, nil
 }
 
+func (s *VMWDriver) GetResourceAllocationInfo(shares int32) *types.ResourceAllocationInfo {
+	return &types.ResourceAllocationInfo{
+		ExpandableReservation: types.NewBool(true),
+		Shares: &types.SharesInfo{
+			Level:  types.SharesLevelLow,
+			Shares: shares,
+		},
+	}
+}
+
 func (h *vmwHandle) run() {
 	h.logger.Printf("[INFO] driver.vmw: Waiting for clone confirmation.")
 	vmInfo, err := h.task.WaitForResult(context.TODO(), nil)
 	if err != nil {
 		h.logger.Printf("[ERR] driver.vmw: Error issuing cloning VM. Error: %v", err)
 	} else {
-		vm := object.NewVirtualMachine(h.client, vmInfo.Result.(types.ManagedObjectReference))
+		h.vm = object.NewVirtualMachine(h.client, vmInfo.Result.(types.ManagedObjectReference))
 		h.logger.Printf("[INFO] driver.vmw: VM cloned.")
 		h.logger.Printf("[INFO] driver.vmw: Powering on VM, and waiting for result.")
-		taskPowerOn, err := vm.PowerOn(context.TODO())
+		taskPowerOn, err := h.vm.PowerOn(context.TODO())
 		if err != nil {
 			h.logger.Printf("[ERR] driver.vmw: Error issuing powering on command for VM. Error: %v", err)
 		}
 
-		_, err = taskPowerOn.WaitForResult(context.TODO(), nil)
+		powerInfo, err := taskPowerOn.WaitForResult(context.TODO(), nil)
 		if err != nil {
 			h.logger.Printf("[ERR] driver.vmw: Error powering on VM. Error: %v", err)
 		}
+		h.logger.Printf("[INFO] driver.vmw: VM powered on. Power on time: %v. Waiting for IP", powerInfo.StartTime)
 
-		h.logger.Printf("[INFO] driver.vmw: VM powered on! Waiting for IP address.")
-		finalInfo, err := vm.WaitForIP(context.TODO())
+		_, err = h.vm.WaitForIP(context.TODO())
 		if err != nil {
 			h.logger.Printf("[ERR] driver.vmw: Error waiting for IP address for VM. Error: %v", err)
 		}
-		h.logger.Printf("[INFO] driver.vmw: VM deployment successful! VM info: %+v", finalInfo)
+		h.logger.Printf("[INFO] driver.vmw: VM: %v deployment successful!", h.vm.InventoryPath)
+		// TODO set resulting UUID in handle
 	}
 
 	close(h.doneCh)
@@ -566,30 +589,55 @@ func (h *vmwHandle) Signal(s os.Signal) error {
 }
 
 func (h *vmwHandle) Kill() error {
-	if err := h.executor.ShutDown(); err != nil {
-		if h.pluginClient.Exited() {
-			return nil
-		}
-		return fmt.Errorf("executor Shutdown failed: %v", err)
-	}
+	// TODO vm.power down
+	// TODO VM.destroy
+	// TODO Use the UUI that comes back from run()
+	return nil
+}
 
-	select {
-	case <-h.doneCh:
-		return nil
-	case <-time.After(h.killTimeout):
-		if h.pluginClient.Exited() {
-			return nil
-		}
-		if err := h.executor.Exit(); err != nil {
-			return fmt.Errorf("executor Exit failed: %v", err)
-		}
-
-		return nil
-	}
+type infoResult struct {
+	VirtualMachines []mo.VirtualMachine
+	objects         []*object.VirtualMachine
+	entities        map[types.ManagedObjectReference]string
+	//cmd             *info
 }
 
 func (h *vmwHandle) Stats() (*cstructs.TaskResourceUsage, error) {
-	return h.executor.Stats()
+	//var props = []string{"summary", "guest.ipAddress", "datastore", "network"}
+	//pc := property.DefaultCollector(h.client.Client)
+	//var vms = mo.VirtualMachine{}
+	//var res infoResult
+	//res.VirtualMachines = make([]mo.VirtualMachine, 1)
+	//res.VirtualMachines[0] = vms
+	//res.objects = make([]*object.VirtualMachine, 1)
+	//res.objects[0] = h.vm
+	//err := pc.RetrieveOne(context.TODO(), h.vm.Reference(), props, &res.VirtualMachines)
+	//if err != nil {
+	//	fmt.Printf("[ERR] driver.vmw: Error getting test result Error: %v", err)
+	//} else {
+	//	res.collectReferences(pc, context.TODO())
+	//	//fmt.Printf("[INFO] driver.vmw: Test result")
+	//	//fmt.Printf("Map len: %v", len(res.entities))
+	//	for k, v := range res.entities {
+	//		//fmt.Printf("in")
+	//		fmt.Printf("key[%v] value[%v]\n", k, v)
+	//	}
+	//	objects := make(map[types.ManagedObjectReference]mo.VirtualMachine, len(res.VirtualMachines))
+	//	for _, o := range res.VirtualMachines {
+	//		objects[o.Reference()] = o
+	//	}
+	//	for _, o := range res.objects {
+	//		vm := objects[o.Reference()]
+	//		s := vm.Summary
+	//
+	//		fmt.Printf("Name: %s\n", s.Config.Name)
+	//		//ms := &cstructs.MemoryStats{
+	//		//	R
+	//		//}
+	//		//cs := &cstructs.CpuStats{}
+	//	}
+	//}
+	return h.resourceUsage, nil
 }
 
 func getDatacenter(c *govmomi.Client, dc string, ctx context.Context) (*object.Datacenter, error) {
@@ -631,3 +679,97 @@ func Datastore(f *find.Finder, name string, ctx context.Context) (*object.Datast
 //	host, err := f.DefaultHostSystem(context)
 //	return host, err
 //}
+
+func (r *infoResult) collectReferences(pc *property.Collector, ctx context.Context) error {
+	r.entities = make(map[types.ManagedObjectReference]string) // MOR -> Name map
+
+	var host []mo.HostSystem
+	var network []mo.Network
+	var opaque []mo.OpaqueNetwork
+	var dvp []mo.DistributedVirtualPortgroup
+	var datastore []mo.Datastore
+	// Table to drive inflating refs to their mo.* counterparts (dest)
+	// and save() the Name to r.entities w/o using reflection here.
+	// Note that we cannot use a []mo.ManagedEntity here, since mo.Network has its own 'Name' field,
+	// the mo.Network.ManagedEntity.Name field will not be set.
+	vrefs := map[string]*struct {
+		dest interface{}
+		refs []types.ManagedObjectReference
+		save func()
+	}{
+		"HostSystem": {
+			&host, nil, func() {
+				for _, e := range host {
+					r.entities[e.Reference()] = e.Name
+				}
+			},
+		},
+		"Network": {
+			&network, nil, func() {
+				for _, e := range network {
+					r.entities[e.Reference()] = e.Name
+				}
+			},
+		},
+		"OpaqueNetwork": {
+			&opaque, nil, func() {
+				for _, e := range opaque {
+					r.entities[e.Reference()] = e.Name
+				}
+			},
+		},
+		"DistributedVirtualPortgroup": {
+			&dvp, nil, func() {
+				for _, e := range dvp {
+					r.entities[e.Reference()] = e.Name
+				}
+			},
+		},
+		"Datastore": {
+			&datastore, nil, func() {
+				for _, e := range datastore {
+					r.entities[e.Reference()] = e.Name
+				}
+			},
+		},
+	}
+
+	xrefs := make(map[types.ManagedObjectReference]bool)
+	// Add MOR to vrefs[kind].refs avoiding any duplicates.
+	addRef := func(refs ...types.ManagedObjectReference) {
+		for _, ref := range refs {
+			if _, exists := xrefs[ref]; exists {
+				return
+			}
+			xrefs[ref] = true
+			vref := vrefs[ref.Type]
+			vref.refs = append(vref.refs, ref)
+		}
+	}
+
+	for _, vm := range r.VirtualMachines {
+		//if r.cmd.General {
+		if ref := vm.Summary.Runtime.Host; ref != nil {
+			addRef(*ref)
+		}
+		//}
+
+		//if r.cmd.Resources {
+		addRef(vm.Datastore...)
+		addRef(vm.Network...)
+		//}
+	}
+
+	for _, vref := range vrefs {
+		if vref.refs == nil {
+			continue
+		}
+		err := pc.Retrieve(ctx, vref.refs, []string{"name"}, vref.dest)
+		if err != nil {
+			return err
+		}
+		vref.save()
+	}
+
+	return nil
+}
