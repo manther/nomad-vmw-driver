@@ -26,9 +26,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"time"
-	//"github.com/vmware/govmomi/govc/vm"
-	//"github.com/vmware/govmomi/task"
 )
 
 const (
@@ -63,20 +62,23 @@ type VMWDriver struct {
 
 // vmwHandle is returned from Start/Open as a handle to the PID
 type vmwHandle struct {
-	pluginClient   *plugin.Client
-	vmName         string
-	executor       executor.Executor
-	allocDir       *allocdir.AllocDir
-	killTimeout    time.Duration
-	maxKillTimeout time.Duration
-	logger         log.Logger
-	version        string
-	waitCh         chan *dstructs.WaitResult
-	doneCh         chan struct{}
-	task           object.Task
-	client         *vim25.Client
-	vm             *object.VirtualMachine
-	resourceUsage  *cstructs.TaskResourceUsage
+	pluginClient      *plugin.Client
+	vmName            string
+	executor          executor.Executor
+	allocDir          *allocdir.AllocDir
+	killTimeout       time.Duration
+	maxKillTimeout    time.Duration
+	logger            log.Logger
+	version           string
+	waitCh            chan *dstructs.WaitResult
+	doneCh            chan struct{}
+	task              object.Task
+	client            *vim25.Client
+	vm                *object.VirtualMachine
+	resourceUsage     *cstructs.TaskResourceUsage
+	Uuid              string
+	Finder            *find.Finder
+	resourceUsageLock sync.RWMutex
 }
 
 type VMWDriverConfig struct {
@@ -337,8 +339,10 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		PowerOn:  false,
 		Template: d.template,
 		Config: &types.VirtualMachineConfigSpec{
-			CpuAllocation:    d.GetResourceAllocationInfo(int32(task.Resources.CPU)),
-			MemoryAllocation: d.GetResourceAllocationInfo(int32(task.Resources.MemoryMB)),
+			//CpuAllocation:    d.GetResourceAllocationInfo(int32(task.Resources.CPU)),
+			//MemoryAllocation: d.GetResourceAllocationInfo(int32(task.Resources.MemoryMB)),
+			CpuAllocation:    d.GetResourceAllocationInfo(3000),
+			MemoryAllocation: d.GetResourceAllocationInfo(50000),
 		},
 	}
 
@@ -472,7 +476,7 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 	}
 
 	// Clone virtual machine
-	d.logger.Printf("[INFO] driver.vmw: clone spec %v", cloneSpec)
+	//d.logger.Printf("[INFO] driver.vmw: clone spec %v", cloneSpec) TODO remove
 	vmTask, err := d.VirtualMachine.Clone(gctx, d.Folder, vmwDriverConfig.Name, *cloneSpec)
 	if err != nil {
 		pluginClient.Kill()
@@ -493,6 +497,7 @@ func (d *VMWDriver) CloneVM(ctx *ExecContext, task *structs.Task) (DriverHandle,
 		waitCh:         make(chan *dstructs.WaitResult, 1),
 		task:           *vmTask,
 		client:         d.Client.Client,
+		Finder:         d.Finder,
 	}
 	if err := executorPlugin.SyncServices(consulContext(d.config, "")); err != nil {
 		d.logger.Printf("[ERR] driver.vmw: error registering services with consul for task: %q: %v", task.Name, err)
@@ -507,7 +512,7 @@ func (s *VMWDriver) GetResourceAllocationInfo(shares int32) *types.ResourceAlloc
 	return &types.ResourceAllocationInfo{
 		ExpandableReservation: types.NewBool(true),
 		Shares: &types.SharesInfo{
-			Level:  types.SharesLevelLow,
+			Level:  types.SharesLevelCustom,
 			Shares: shares,
 		},
 	}
@@ -538,7 +543,6 @@ func (h *vmwHandle) run() {
 			h.logger.Printf("[ERR] driver.vmw: Error waiting for IP address for VM. Error: %v", err)
 		}
 		h.logger.Printf("[INFO] driver.vmw: VM: %v deployment successful!", h.vm.InventoryPath)
-		// TODO set resulting UUID in handle
 	}
 
 	close(h.doneCh)
@@ -553,6 +557,25 @@ func (h *vmwHandle) run() {
 		h.logger.Printf("[ERR] driver.vmw: failed to exit: %v", err)
 	}
 	h.pluginClient.Kill()
+}
+
+func (h *vmwHandle) GetInfo(vm *object.VirtualMachine) *types.VirtualMachineSummary {
+	pc := property.DefaultCollector(h.client)
+	var res = infoResult{
+		VirtualMachines: []mo.VirtualMachine{},
+		objects:         []*object.VirtualMachine{vm},
+	}
+	err := pc.RetrieveOne(context.TODO(), vm.Reference(),
+		[]string{"summary", "guest.ipAddress", "datastore", "network"},
+		&res.VirtualMachines)
+	if err != nil && len(res.VirtualMachines) > 0 {
+		fmt.Printf("[ERR] driver.vmw: Error getting VM info Error: %v", err)
+	} else if len(res.VirtualMachines) > 0 {
+		return &res.VirtualMachines[0].Summary
+	} else {
+		fmt.Printf("[ERR] driver.vmw: Unable to retrieve VM info")
+	}
+	return nil
 }
 
 func (h *vmwHandle) ID() string {
@@ -589,9 +612,17 @@ func (h *vmwHandle) Signal(s os.Signal) error {
 }
 
 func (h *vmwHandle) Kill() error {
-	// TODO vm.power down
-	// TODO VM.destroy
-	// TODO Use the UUI that comes back from run()
+	task, err := h.vm.PowerOff(context.TODO())
+	if err != nil {
+		return err
+	}
+	_, err = task.WaitForResult(context.TODO(), nil)
+
+	task, err = h.vm.Destroy(context.TODO())
+	if err != nil {
+		return err
+	}
+	_, err = task.WaitForResult(context.TODO(), nil)
 	return nil
 }
 
@@ -603,40 +634,42 @@ type infoResult struct {
 }
 
 func (h *vmwHandle) Stats() (*cstructs.TaskResourceUsage, error) {
-	//var props = []string{"summary", "guest.ipAddress", "datastore", "network"}
-	//pc := property.DefaultCollector(h.client.Client)
-	//var vms = mo.VirtualMachine{}
-	//var res infoResult
-	//res.VirtualMachines = make([]mo.VirtualMachine, 1)
-	//res.VirtualMachines[0] = vms
-	//res.objects = make([]*object.VirtualMachine, 1)
-	//res.objects[0] = h.vm
-	//err := pc.RetrieveOne(context.TODO(), h.vm.Reference(), props, &res.VirtualMachines)
-	//if err != nil {
-	//	fmt.Printf("[ERR] driver.vmw: Error getting test result Error: %v", err)
-	//} else {
-	//	res.collectReferences(pc, context.TODO())
-	//	//fmt.Printf("[INFO] driver.vmw: Test result")
-	//	//fmt.Printf("Map len: %v", len(res.entities))
-	//	for k, v := range res.entities {
-	//		//fmt.Printf("in")
-	//		fmt.Printf("key[%v] value[%v]\n", k, v)
-	//	}
-	//	objects := make(map[types.ManagedObjectReference]mo.VirtualMachine, len(res.VirtualMachines))
-	//	for _, o := range res.VirtualMachines {
-	//		objects[o.Reference()] = o
-	//	}
-	//	for _, o := range res.objects {
-	//		vm := objects[o.Reference()]
-	//		s := vm.Summary
-	//
-	//		fmt.Printf("Name: %s\n", s.Config.Name)
-	//		//ms := &cstructs.MemoryStats{
-	//		//	R
-	//		//}
-	//		//cs := &cstructs.CpuStats{}
-	//	}
-	//}
+	vm, err := h.Finder.VirtualMachine(context.TODO(), h.vm.InventoryPath)
+	if err != nil {
+		h.logger.Printf("[ERR] driver.vmw: Error waiting for IP address for VM. Error: %v", err)
+	} else {
+		s := h.GetInfo(vm)
+		ms := &cstructs.MemoryStats{
+			RSS: uint64(s.QuickStats.GuestMemoryUsage),
+			//Cache:    s.MemoryStats.Stats.Cache,
+			//Swap:     s.MemoryStats.Stats.Swap,
+			//MaxUsage: s.MemoryStats.MaxUsage,
+			Measured: []string{},
+		}
+		cs := &cstructs.CpuStats{
+			Percent: float64(s.QuickStats.OverallCpuUsage),
+			//ThrottledPeriods: s.CPUStats.ThrottlingData.ThrottledPeriods,
+			//ThrottledTime:    s.CPUStats.ThrottlingData.ThrottledTime,
+			Measured: []string{},
+		}
+
+		// Calculate percentage
+		//cores := len(s.Config.NumCpu)
+		//cs.Percent = s.QuickStats.OverallCpuUsage
+		//cs.SystemMode = 0
+		//cs.UserMode = 0
+		//cs.TotalTicks = 0
+
+		h.resourceUsageLock.Lock()
+		h.resourceUsage = &cstructs.TaskResourceUsage{
+			ResourceUsage: &cstructs.ResourceUsage{
+				MemoryStats: ms,
+				CpuStats:    cs,
+			},
+			Timestamp: time.Now().UnixNano(),
+		}
+		h.resourceUsageLock.Unlock()
+	}
 	return h.resourceUsage, nil
 }
 
